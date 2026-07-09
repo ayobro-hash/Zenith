@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pulse — Website Status Monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          bg: '#0a0a0a',
+          surface: '#111113',
+          'surface-hover': '#17171a',
+          border: '#1f1f22',
+          'border-strong': '#2c2c30',
+          primary: '#eaeae8',
+          secondary: '#8c8c89',
+          tertiary: '#57575a',
+          up: '#34d17c',
+          down: '#f2495c',
+          checking: '#f5b942',
+        },
+        fontFamily: {
+          display: ['"Space Grotesk"', 'sans-serif'],
+          mono: ['"JetBrains Mono"', 'monospace'],
+        },
+      },
+    },
+  };
+</script>
+<style>
+  html { color-scheme: dark; }
+  body { font-family: 'Space Grotesk', sans-serif; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: #0a0a0a; }
+  ::-webkit-scrollbar-thumb { background: #1f1f22; border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: #2c2c30; }
+  *:focus-visible { outline: 2px solid #34d17c; outline-offset: 2px; }
+
+  @keyframes toastIn { from { opacity: 0; transform: translateX(24px); } to { opacity: 1; transform: translateX(0); } }
+  .toast-in { animation: toastIn .25s ease-out; }
+  .toast-out { opacity: 0; transform: translateX(24px); transition: opacity .25s ease-in, transform .25s ease-in; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .animate-ping, .animate-spin { animation: none !important; }
+  }
+</style>
+</head>
+<body class="bg-bg text-primary min-h-screen">
+
+  <div class="max-w-3xl mx-auto px-4 sm:px-6 py-10">
+
+    <header class="mb-8">
+      <div class="flex items-center justify-between flex-wrap gap-3">
+        <div class="flex items-center gap-2.5">
+          <span class="relative flex h-2.5 w-2.5">
+            <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-up opacity-60"></span>
+            <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-up"></span>
+          </span>
+          <h1 class="font-display text-lg font-semibold tracking-tight">PULSE</h1>
+          <span class="text-xs font-mono text-tertiary hidden sm:inline">/ website status monitor</span>
+        </div>
+        <div id="stats" class="text-xs font-mono text-secondary"></div>
+      </div>
+      <div class="mt-4 h-px w-full" style="background:linear-gradient(to right, transparent, #34d17c66, transparent);"></div>
+    </header>
+
+    <form id="add-form" class="flex items-stretch gap-2">
+      <input id="url-input" type="text" placeholder="https://example.com" autocomplete="off" spellcheck="false"
+        class="flex-1 min-w-0 bg-transparent border-b border-border focus:border-up outline-none px-1 py-2.5 font-mono text-sm text-primary placeholder:text-tertiary transition-colors" />
+      <button type="submit"
+        class="px-4 py-2 text-xs font-mono font-semibold tracking-wider uppercase border border-border-strong hover:border-up hover:text-up rounded transition-colors">
+        Track
+      </button>
+    </form>
+
+    <div class="flex items-center justify-between mt-3 mb-6">
+      <button id="check-all-btn" type="button" class="text-xs font-mono text-secondary hover:text-primary transition-colors">
+        ↻ check all
+      </button>
+      <label class="flex items-center gap-2 text-xs font-mono text-secondary cursor-pointer select-none">
+        <input id="auto-refresh" type="checkbox" class="accent-up w-3.5 h-3.5" />
+        auto-refresh (60s)
+      </label>
+    </div>
+
+    <div id="site-list"></div>
+
+    <div id="empty-state" class="hidden py-16 text-center">
+      <p class="text-sm text-secondary">No sites tracked yet.</p>
+      <p class="text-xs font-mono text-tertiary mt-1">Add a URL above to start monitoring.</p>
+    </div>
+
+    <p class="mt-10 text-[11px] font-mono text-tertiary leading-relaxed">
+      Checks work by attempting a direct connection from your browser. Browser security rules mean this can confirm a
+      server responds, but can't read its HTTP status — a real 404 page still counts as "up," and it can't always
+      tell "down" apart from "blocked by your network." Open this file directly in a full browser tab for the most
+      reliable results. Nothing is saved between sessions.
+    </p>
+
+  </div>
+
+  <div id="toast-container" class="fixed bottom-5 right-5 flex flex-col gap-2 z-50 w-[280px]"></div>
+
+<script>
+  // ---------- State ----------
+  let sites = [];
+  let autoRefreshTimer = null;
+  const HISTORY_SLOTS = 24;
+  const CHECK_TIMEOUT_MS = 8000;
+
+  const listEl = document.getElementById('site-list');
+  const emptyEl = document.getElementById('empty-state');
+  const statsEl = document.getElementById('stats');
+  const toastContainer = document.getElementById('toast-container');
+  const form = document.getElementById('add-form');
+  const urlInput = document.getElementById('url-input');
+
+  // ---------- Helpers ----------
+  function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, ch => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[ch]));
+  }
+
+  function normalizeUrl(raw) {
+    let s = (raw || '').trim();
+    if (!s) throw new Error('empty');
+    if (!/^https?:\/\//i.test(s)) s = 'https://' + s;
+    const u = new URL(s);
+    if (!u.hostname.includes('.')) throw new Error('invalid host');
+    return u.href;
+  }
+
+  function hostnameOf(url) {
+    return new URL(url).hostname.replace(/^www\./, '');
+  }
+
+  function formatRelative(ts) {
+    if (!ts) return 'never';
+    const s = Math.floor((Date.now() - ts) / 1000);
+    if (s < 5) return 'just now';
+    if (s < 60) return s + 's ago';
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + 'm ago';
+    const h = Math.floor(m / 60);
+    if (h < 24) return h + 'h ago';
+    const d = Math.floor(h / 24);
+    return d + 'd ago';
+  }
+
+  function formatDateTime(ts) {
+    if (!ts) return 'never';
+    return new Date(ts).toLocaleString(undefined, {
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+    });
+  }
+
+  // ---------- Networking ----------
+  async function pingUrl(url) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CHECK_TIMEOUT_MS);
+    const start = performance.now();
+    try {
+      await fetch(url, { mode: 'no-cors', cache: 'no-store', redirect: 'follow', signal: controller.signal });
+      clearTimeout(timer);
+      return { ok: true, time: Math.round(performance.now() - start) };
+    } catch (err) {
+      clearTimeout(timer);
+      return { ok: false, time: null };
+    }
+  }
+
+  // ---------- Site management ----------
+  function createSite(href) {
+    return {
+      id: (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Math.random().toString(36).slice(2)),
+      url: href,
+      name: hostnameOf(href),
+      status: 'checking',
+      lastChecked: null,
+      lastDown: null,
+      responseTime: null,
+      history: [],
+    };
+  }
+
+  async function checkSite(id) {
+    const site = sites.find(s => s.id === id);
+    if (!site) return;
+    site.status = 'checking';
+    render();
+
+    const result = await pingUrl(site.url);
+    site.status = result.ok ? 'up' : 'down';
+    site.responseTime = result.ok ? result.time : null;
+    site.lastChecked = Date.now();
+    if (!result.ok) site.lastDown = Date.now();
+    site.history.push({ t: Date.now(), ok: result.ok });
+    if (site.history.length > HISTORY_SLOTS) site.history.shift();
+
+    render();
+    showToast(site, result);
+  }
+
+  function checkAll() {
+    sites.forEach(s => checkSite(s.id));
+  }
+
+  function removeSite(id) {
+    sites = sites.filter(s => s.id !== id);
+    render();
+  }
+
+  // expose for inline handlers
+  window.checkSite = checkSite;
+  window.removeSite = removeSite;
+
+  // ---------- Rendering ----------
+  function statusDot(status) {
+    if (status === 'up') {
+      return `<span class="relative flex h-2.5 w-2.5">
+        <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-up opacity-60"></span>
+        <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-up"></span>
+      </span>`;
+    }
+    if (status === 'down') {
+      return `<span class="inline-flex rounded-full h-2.5 w-2.5 bg-down"></span>`;
+    }
+    if (status === 'checking') {
+      return `<span class="inline-block h-2.5 w-2.5 rounded-full border-2 border-checking border-t-transparent animate-spin"></span>`;
+    }
+    return `<span class="inline-flex rounded-full h-2.5 w-2.5 bg-tertiary/40"></span>`;
+  }
+
+  function statusBadge(status) {
+    const base = 'text-[10px] font-mono font-semibold tracking-wider';
+    if (status === 'up') return `<span class="${base} text-up">UP</span>`;
+    if (status === 'down') return `<span class="${base} text-down">DOWN</span>`;
+    if (status === 'checking') return `<span class="${base} text-checking">CHECKING&hellip;</span>`;
+    return `<span class="${base} text-tertiary">UNKNOWN</span>`;
+  }
+
+  function renderBars(history) {
+    const pad = Array(Math.max(0, HISTORY_SLOTS - history.length)).fill(null);
+    const slots = pad.concat(history);
+    return slots.map(h => {
+      if (!h) return `<span class="w-1 h-4 rounded-sm bg-border" title="No data"></span>`;
+      const color = h.ok ? 'bg-up' : 'bg-down';
+      const label = escapeHtml((h.ok ? 'Up' : 'Down') + ' · ' + formatDateTime(h.t));
+      return `<span class="w-1 h-4 rounded-sm ${color}" title="${label}"></span>`;
+    }).join('');
+  }
+
+  function renderSiteRow(site) {
+    return `
+    <div class="group flex items-start gap-3 sm:gap-4 py-4 px-2 -mx-2 border-b border-border hover:bg-surface-hover rounded transition-colors">
+      <div class="pt-1.5 shrink-0">${statusDot(site.status)}</div>
+      <img src="https://www.google.com/s2/favicons?sz=32&domain=${encodeURIComponent(site.name)}"
+           class="w-4 h-4 mt-1 rounded-sm opacity-80 shrink-0" onerror="this.style.display='none'" alt="" />
+      <div class="flex-1 min-w-0">
+        <div class="flex items-baseline gap-2 flex-wrap">
+          <span class="font-medium text-primary truncate">${escapeHtml(site.name)}</span>
+          ${statusBadge(site.status)}
+        </div>
+        <div class="text-xs font-mono text-secondary truncate">${escapeHtml(site.url)}</div>
+        <div class="flex gap-0.5 mt-2.5">${renderBars(site.history)}</div>
+        <div class="flex flex-wrap gap-x-4 gap-y-1 mt-2 text-[11px] font-mono text-tertiary">
+          <span>checked ${formatRelative(site.lastChecked)}</span>
+          <span>last down: ${site.lastDown ? formatDateTime(site.lastDown) : 'never'}</span>
+          ${site.responseTime ? `<span>${site.responseTime}ms</span>` : ''}
+        </div>
+      </div>
+      <div class="flex flex-col gap-1.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity shrink-0">
+        <button onclick="checkSite('${site.id}')" title="Check now"
+          class="w-6 h-6 flex items-center justify-center text-tertiary hover:text-primary border border-transparent hover:border-border-strong rounded text-sm">↻</button>
+        <button onclick="removeSite('${site.id}')" title="Remove"
+          class="w-6 h-6 flex items-center justify-center text-tertiary hover:text-down border border-transparent rounded text-sm">×</button>
+      </div>
+    </div>`;
+  }
+
+  function render() {
+    const up = sites.filter(s => s.status === 'up').length;
+    const down = sites.filter(s => s.status === 'down').length;
+    statsEl.textContent = `${sites.length} tracked · ${up} up · ${down} down`;
+
+    if (sites.length === 0) {
+      listEl.innerHTML = '';
+      emptyEl.classList.remove('hidden');
+      return;
+    }
+    emptyEl.classList.add('hidden');
+    listEl.innerHTML = sites.map(renderSiteRow).join('');
+  }
+
+  // ---------- Notifications ----------
+  function showToast(site, result) {
+    const el = document.createElement('div');
+    el.className = `toast-in border-l-2 ${result.ok ? 'border-up' : 'border-down'} bg-surface border-t border-r border-b border-border rounded px-3.5 py-3 shadow-lg`;
+    el.innerHTML = `
+      <div class="flex items-start gap-2.5">
+        <span class="font-mono text-xs mt-0.5 ${result.ok ? 'text-up' : 'text-down'}">${result.ok ? '✓' : '✕'}</span>
+        <div class="flex-1 min-w-0">
+          <div class="text-sm font-medium truncate">${escapeHtml(site.name)}</div>
+          <div class="text-xs text-secondary font-mono">${result.ok ? 'is up' : 'is down'}${result.ok && result.time ? ' · ' + result.time + 'ms' : ''}</div>
+        </div>
+      </div>`;
+    toastContainer.appendChild(el);
+    setTimeout(() => {
+      el.classList.remove('toast-in');
+      el.classList.add('toast-out');
+      setTimeout(() => el.remove(), 260);
+    }, 4000);
+  }
+
+  function toastError(message) {
+    const el = document.createElement('div');
+    el.className = 'toast-in border-l-2 border-checking bg-surface border-t border-r border-b border-border rounded px-3.5 py-3 shadow-lg';
+    el.innerHTML = `
+      <div class="flex items-start gap-2.5">
+        <span class="font-mono text-xs mt-0.5 text-checking">!</span>
+        <div class="flex-1 min-w-0 text-sm">${escapeHtml(message)}</div>
+      </div>`;
+    toastContainer.appendChild(el);
+    setTimeout(() => {
+      el.classList.remove('toast-in');
+      el.classList.add('toast-out');
+      setTimeout(() => el.remove(), 260);
+    }, 4000);
+  }
+
+  // ---------- Events ----------
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    let href;
+    try {
+      href = normalizeUrl(urlInput.value);
+    } catch (err) {
+      toastError('Enter a valid website URL, e.g. example.com');
+      return;
+    }
+    if (sites.some(s => s.url === href)) {
+      toastError('Already tracking this site');
+      return;
+    }
+    const site = createSite(href);
+    sites.unshift(site);
+    urlInput.value = '';
+    render();
+    checkSite(site.id);
+  });
+
+  document.getElementById('check-all-btn').addEventListener('click', checkAll);
+
+  document.getElementById('auto-refresh').addEventListener('change', (e) => {
+    if (e.target.checked) {
+      autoRefreshTimer = setInterval(checkAll, 60000);
+    } else {
+      clearInterval(autoRefreshTimer);
+      autoRefreshTimer = null;
+    }
+  });
+
+  // ---------- Init ----------
+  function init() {
+    sites = [
+      createSite('https://www.google.com'),
+      createSite('https://www.github.com'),
+      createSite('https://this-domain-does-not-exist-xyz123.com'),
+    ];
+    render();
+    checkAll();
+  }
+
+  init();
+</script>
+</body>
+</html>
